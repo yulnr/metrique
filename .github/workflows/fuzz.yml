@@ -1,0 +1,81 @@
+name: Fuzz
+on:
+  schedule:
+    - cron: "0 6 * * *" # Every day at 06:00 UTC
+  workflow_dispatch: # Allow manual triggers
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Nightly Fuzz
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Compute corpus cache bucket
+        id: corpus_bucket
+        run: |
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore fuzz corpus cache
+        id: corpus_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          # Policy:
+          # - one evolving cache lineage per branch per day
+          # - restore from same-day first, then same week, then branch, then OS-wide fallback
+          # - keep corpus in cache (not committed) to avoid repository bloat
+          key: fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ steps.corpus_bucket.outputs.day }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ steps.corpus_bucket.outputs.day }}-
+            fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ steps.corpus_bucket.outputs.week }}-
+            fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-
+            fuzz-corpus-${{ runner.os }}-
+      - name: Ensure corpus directories exist
+        run: mkdir -p fuzz/corpus/fuzz_json fuzz/corpus/fuzz_emf
+      - name: Install cargo-fuzz
+        uses: dtolnay/install@cargo-fuzz
+      - name: Run fuzz_json
+        run: cargo +nightly fuzz run fuzz_json -- -max_total_time=300
+      - name: Run fuzz_emf
+        run: cargo +nightly fuzz run fuzz_emf -- -max_total_time=300
+      - name: Prune corpus to size cap
+        if: always()
+        run: |
+          set -euo pipefail
+          max_bytes=$((50 * 1024 * 1024))
+          if [ ! -d fuzz/corpus ]; then
+            exit 0
+          fi
+          current_bytes=$(du -sb fuzz/corpus | cut -f1)
+          if [ "$current_bytes" -le "$max_bytes" ]; then
+            echo "Corpus size within cap: ${current_bytes} bytes"
+            exit 0
+          fi
+          echo "Pruning corpus from ${current_bytes} bytes to <= ${max_bytes} bytes"
+          while [ "$current_bytes" -gt "$max_bytes" ]; do
+            largest_file=$(find fuzz/corpus -type f -printf '%s %p\n' | sort -nr | awk 'NR==1 {print $2}')
+            if [ -z "$largest_file" ]; then
+              break
+            fi
+            rm -f "$largest_file"
+            current_bytes=$(du -sb fuzz/corpus | cut -f1)
+          done
+          echo "Corpus size after pruning: ${current_bytes} bytes"
+      - name: Save fuzz corpus cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus
+          key: ${{ steps.corpus_restore.outputs.cache-primary-key }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
