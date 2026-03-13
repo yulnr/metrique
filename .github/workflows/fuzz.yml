@@ -48,7 +48,7 @@ jobs:
           # - one evolving cache lineage per branch per day
           # - restore from same-day first, then same week, then branch, then OS-wide fallback
           # - keep corpus in cache (not committed) to avoid repository bloat
-          key: fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ steps.corpus_bucket.outputs.day }}-${{ github.run_attempt }}
+          key: fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ steps.corpus_bucket.outputs.day }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ steps.corpus_bucket.outputs.day }}-
             fuzz-corpus-${{ runner.os }}-${{ github.ref_name }}-${{ steps.corpus_bucket.outputs.week }}-
