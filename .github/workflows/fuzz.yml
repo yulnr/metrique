@@ -2,7 +2,7 @@ name: Fuzz
 on:
   push:
     branches:
-      - test/fuzz-testing-json
+      - tests/fuzz-testing-json
     # paths:
     #   - "fuzz/**"
     #   - ".github/workflows/fuzz.yml"
