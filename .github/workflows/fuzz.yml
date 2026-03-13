@@ -27,6 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz-nightly-${{ runner.os }}
+          workspaces: |
+            . -> target
+            fuzz -> fuzz/target
       - name: Compute corpus cache bucket
         id: corpus_bucket
         run: |
