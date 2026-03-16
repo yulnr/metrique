@@ -6,23 +6,18 @@ use arbitrary::Unstructured;
 use libfuzzer_sys::fuzz_target;
 
 use metrique_writer_core::format::Format;
-use metrique_writer_format_json::{Json, ObservationFormat, RepeatedFormat};
+use metrique_writer_format_json::Json;
 
 use fuzz_entry::FuzzEntry;
 
 fuzz_target!(|data: &[u8]| {
-    let Ok((entry_a, entry_b, format_selector)) =
-        Unstructured::new(data).arbitrary::<(FuzzEntry, FuzzEntry, u8)>()
+    let Ok((entry_a, entry_b)) =
+        Unstructured::new(data).arbitrary::<(FuzzEntry, FuzzEntry)>()
     else {
         return;
     };
-    let observation_format = match format_selector % 3 {
-        0 => ObservationFormat::Scalar(RepeatedFormat::TotalAndCount),
-        1 => ObservationFormat::Scalar(RepeatedFormat::Mean),
-        _ => ObservationFormat::Histogram,
-    };
 
-    let mut format = Json::new().with_observation_format(observation_format);
+    let mut format = Json::new();
     let mut output = Vec::new();
 
     // Format the entry, we don't care if it returns a validation error,
