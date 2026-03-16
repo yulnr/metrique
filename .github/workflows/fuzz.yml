@@ -62,29 +62,22 @@ jobs:
         run: cargo +nightly fuzz run fuzz_json -- -max_total_time=300
       - name: Run fuzz_emf
         run: cargo +nightly fuzz run fuzz_emf -- -max_total_time=300
-      - name: Prune corpus to size cap
+      - name: Minimize corpus
         if: always()
         run: |
           set -euo pipefail
-          max_bytes=$((50 * 1024 * 1024))
-          if [ ! -d fuzz/corpus ]; then
-            exit 0
-          fi
-          current_bytes=$(du -sb fuzz/corpus | cut -f1)
-          if [ "$current_bytes" -le "$max_bytes" ]; then
-            echo "Corpus size within cap: ${current_bytes} bytes"
-            exit 0
-          fi
-          echo "Pruning corpus from ${current_bytes} bytes to <= ${max_bytes} bytes"
-          while [ "$current_bytes" -gt "$max_bytes" ]; do
-            largest_file=$(find fuzz/corpus -type f -printf '%s %p\n' | sort -nr | awk 'NR==1 {print $2}')
-            if [ -z "$largest_file" ]; then
-              break
+          for target in fuzz_json fuzz_emf; do
+            corpus_dir="fuzz/corpus/${target}"
+            if [ -d "$corpus_dir" ] && [ "$(ls -A "$corpus_dir" 2>/dev/null)" ]; then
+              echo "Minimizing corpus for ${target}..."
+              before=$(find "$corpus_dir" -type f | wc -l)
+              cargo +nightly fuzz cmin "$target" || true
+              after=$(find "$corpus_dir" -type f | wc -l)
+              echo "${target}: ${before} -> ${after} corpus entries"
+            else
+              echo "No corpus to minimize for ${target}"
             fi
-            rm -f "$largest_file"
-            current_bytes=$(du -sb fuzz/corpus | cut -f1)
           done
-          echo "Corpus size after pruning: ${current_bytes} bytes"
       - name: Save fuzz corpus cache
         if: always()
         uses: actions/cache/save@v4

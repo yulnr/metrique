@@ -1,3 +1,11 @@
+//! Fuzz target for the EMF (Embedded Metric Format) formatter.
+//!
+//! Invariants tested:
+//! - Successful formatting always produces one or more valid, newline-delimited JSON objects.
+//! - Formatter state reuse across entries does not corrupt output.
+//! - Both regular and sampled paths are exercised, with EMF-specific flag modes
+//!   (HighStorageResolution, NoMetric) applied to metrics.
+
 #![no_main]
 
 mod fuzz_entry;
@@ -7,9 +15,104 @@ use libfuzzer_sys::fuzz_target;
 
 use metrique_writer_core::format::Format;
 use metrique_writer_core::sample::SampledFormat;
-use metrique_writer_format_emf::Emf;
+use metrique_writer_core::{Entry, EntryWriter};
+use metrique_writer_format_emf::{Emf, HighStorageResolution, NoMetric};
 
-use fuzz_entry::FuzzEntry;
+use fuzz_entry::{
+    FuzzEntry, FuzzField, FuzzMetricValue, arbitrary_sample_rate, arbitrary_string,
+};
+
+/// EMF-specific flag mode applied on top of base fuzz entries.
+#[derive(Debug, Clone, Copy)]
+enum FuzzMetricFlagMode {
+    None,
+    HighStorageResolution,
+    NoMetric,
+    HighThenNoMetric,
+    NoMetricThenHigh,
+}
+
+impl<'a> arbitrary::Arbitrary<'a> for FuzzMetricFlagMode {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let tag: u8 = u.arbitrary()?;
+        Ok(match tag % 5 {
+            0 => FuzzMetricFlagMode::None,
+            1 => FuzzMetricFlagMode::HighStorageResolution,
+            2 => FuzzMetricFlagMode::NoMetric,
+            3 => FuzzMetricFlagMode::HighThenNoMetric,
+            _ => FuzzMetricFlagMode::NoMetricThenHigh,
+        })
+    }
+}
+
+/// Wrapper around `FuzzEntry` that applies EMF-specific flag modes to metrics.
+#[derive(Debug)]
+struct EmfFuzzEntry {
+    inner: FuzzEntry,
+    /// One flag mode per metric field. Non-metric fields use index but ignore the flag.
+    flag_modes: Vec<FuzzMetricFlagMode>,
+}
+
+impl Entry for EmfFuzzEntry {
+    fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
+        // Delegate config and timestamps to the base entry's logic,
+        // but handle fields ourselves to apply EMF flags.
+        if self.inner.allow_split_entries {
+            writer.config(&const { metrique_writer_core::config::AllowSplitEntries::new() });
+        }
+        if let Some(entry_dimensions) = &self.inner.entry_dimensions {
+            writer.config(entry_dimensions);
+        }
+        for timestamp in &self.inner.timestamps {
+            writer.timestamp(timestamp.to_system_time());
+        }
+        for (i, field) in self.inner.fields.iter().enumerate() {
+            let flag_mode = self
+                .flag_modes
+                .get(i)
+                .copied()
+                .unwrap_or(FuzzMetricFlagMode::None);
+            match field {
+                FuzzField::StringProperty { name, value } => {
+                    writer.value(name.as_str(), &value.as_str());
+                }
+                FuzzField::Metric {
+                    name,
+                    observations,
+                    dimensions,
+                    unit,
+                } => {
+                    let metric = FuzzMetricValue {
+                        observations,
+                        dimensions,
+                        unit: *unit,
+                    };
+                    match flag_mode {
+                        FuzzMetricFlagMode::None => writer.value(name.as_str(), &metric),
+                        FuzzMetricFlagMode::HighStorageResolution => {
+                            writer.value(name.as_str(), &HighStorageResolution::from(metric));
+                        }
+                        FuzzMetricFlagMode::NoMetric => {
+                            writer.value(name.as_str(), &NoMetric::from(metric));
+                        }
+                        FuzzMetricFlagMode::HighThenNoMetric => {
+                            writer.value(
+                                name.as_str(),
+                                &NoMetric::from(HighStorageResolution::from(metric)),
+                            );
+                        }
+                        FuzzMetricFlagMode::NoMetricThenHigh => {
+                            writer.value(
+                                name.as_str(),
+                                &HighStorageResolution::from(NoMetric::from(metric)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// EMF can produce multiple newline-delimited JSON documents (split entries).
 fn assert_valid_json_lines(output: &[u8], context: &str) {
@@ -86,30 +189,6 @@ impl<'a> arbitrary::Arbitrary<'a> for FuzzEmfConfig {
     }
 }
 
-fn arbitrary_string<'a>(u: &mut Unstructured<'a>, max_len: usize) -> arbitrary::Result<String> {
-    let len = (u.arbitrary::<u8>()? as usize).min(max_len);
-    let mut s = String::with_capacity(len);
-    for _ in 0..len {
-        s.push(u.arbitrary::<char>()?);
-    }
-    Ok(s)
-}
-
-fn arbitrary_sample_rate<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<f32> {
-    let selector: u8 = u.arbitrary()?;
-    Ok(match selector % 10 {
-        0 => f32::NAN,
-        1 => 0.0,
-        2 => -1.0,
-        3 => f32::INFINITY,
-        4 => 1.0,
-        5 => 0.5,
-        6 => 0.001,
-        7 => 1e-30,
-        _ => f32::from_bits(u.arbitrary()?),
-    })
-}
-
 fn build_emf(config: &FuzzEmfConfig) -> Emf {
     let mut builder = Emf::builder(config.namespace.clone(), config.default_dimensions.clone())
         .allow_ignored_dimensions(config.allow_ignored_dimensions);
@@ -129,14 +208,28 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
+    // Generate flag modes for each entry's fields.
+    let flags_a: Vec<FuzzMetricFlagMode> = (0..entry_a.fields.len())
+        .map(|_| u.arbitrary().unwrap_or(FuzzMetricFlagMode::None))
+        .collect();
+    let flags_b: Vec<FuzzMetricFlagMode> = (0..entry_b.fields.len())
+        .map(|_| u.arbitrary().unwrap_or(FuzzMetricFlagMode::None))
+        .collect();
+
+    let emf_entry_a = EmfFuzzEntry {
+        inner: entry_a,
+        flag_modes: flags_a,
+    };
+    let emf_entry_b = EmfFuzzEntry {
+        inner: entry_b,
+        flag_modes: flags_b,
+    };
+
     // Regular EMF path.
-    // Baseline invariant only: successful formatting must emit parseable JSON objects.
-    // Deeper semantic invariants can be added in future, but this structural guard should
-    // always remain.
     let mut format = build_emf(&config);
     let mut output = Vec::new();
 
-    let result = format.format(&entry_a, &mut output);
+    let result = format.format(&emf_entry_a, &mut output);
 
     if let Ok(()) = result {
         assert_valid_json_lines(&output, "first call");
@@ -144,7 +237,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Test formatter state reuse with a different entry.
     output.clear();
-    let result = format.format(&entry_b, &mut output);
+    let result = format.format(&emf_entry_b, &mut output);
     if let Ok(()) = result {
         assert_valid_json_lines(&output, "state reuse call");
     }
@@ -152,12 +245,12 @@ fuzz_target!(|data: &[u8]| {
     // Sampled EMF path.
     let mut sampled = build_emf(&config).with_sampling();
     output.clear();
-    let result = sampled.format_with_sample_rate(&entry_a, &mut output, config.sample_rate_a);
+    let result = sampled.format_with_sample_rate(&emf_entry_a, &mut output, config.sample_rate_a);
     if let Ok(()) = result {
         assert_valid_json_lines(&output, "sampled first call");
     }
     output.clear();
-    let result = sampled.format_with_sample_rate(&entry_b, &mut output, config.sample_rate_b);
+    let result = sampled.format_with_sample_rate(&emf_entry_b, &mut output, config.sample_rate_b);
     if let Ok(()) = result {
         assert_valid_json_lines(&output, "sampled state reuse call");
     }

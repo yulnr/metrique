@@ -6,14 +6,17 @@ use std::time::{Duration, SystemTime};
 use arbitrary::{Arbitrary, Unstructured};
 
 use metrique_writer_core::{
-    Entry, EntryWriter, MetricFlags, Observation, Unit, ValueWriter,
     config::{AllowSplitEntries, EntryDimensions},
     unit::{NegativeScale, PositiveScale},
+    Entry, EntryWriter, MetricFlags, Observation, Unit, ValueWriter,
 };
-use metrique_writer_format_emf::{HighStorageResolution, NoMetric};
 
+// Configuration values used to control the frequency of different types of fields and observations.
+/// Percentage of entries to omit entry dimensions.
 const OMIT_ENTRY_DIMENSIONS_PERCENT: u8 = 55;
+/// Percentage of fields to reuse existing name.
 const REUSE_EXISTING_NAME_PERCENT: u8 = 70;
+/// Percentage of fields to replace existing name in the pool.
 const REPLACE_EXISTING_POOL_NAME_PERCENT: u8 = 20;
 
 /// A single field in our fuzzed entry.
@@ -26,8 +29,7 @@ pub enum FuzzField {
         name: String,
         observations: Vec<FuzzObservation>,
         dimensions: Vec<(String, String)>,
-        unit: FuzzUnit,
-        flag_mode: FuzzMetricFlagMode,
+        unit: Unit,
     },
 }
 
@@ -39,7 +41,7 @@ pub enum FuzzObservation {
 }
 
 impl FuzzObservation {
-    fn to_observation(&self) -> Observation {
+    pub fn to_observation(&self) -> Observation {
         match *self {
             FuzzObservation::Unsigned(v) => Observation::Unsigned(v),
             FuzzObservation::Floating(v) => Observation::Floating(v),
@@ -56,10 +58,6 @@ impl<'a> Arbitrary<'a> for FuzzObservation {
         match tag % 4 {
             0 => Ok(FuzzObservation::Unsigned(u.arbitrary()?)),
             1 => Ok(FuzzObservation::Floating(arbitrary_f64(u)?)),
-            2 => Ok(FuzzObservation::Repeated {
-                total: arbitrary_f64(u)?,
-                occurrences: u.arbitrary()?,
-            }),
             _ => Ok(FuzzObservation::Repeated {
                 total: arbitrary_f64(u)?,
                 // Keep this edge case frequent: repeated with 0 count.
@@ -73,88 +71,31 @@ impl<'a> Arbitrary<'a> for FuzzObservation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum FuzzUnit {
-    None,
-    Count,
-    Percent,
-    SecondMicro,
-    SecondMilli,
-    Second,
-    Byte,
-    KiloByte,
-    MegaByte,
-    Bit,
-    KiloBit,
+pub fn arbitrary_unit<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<Unit> {
+    let tag: u8 = u.arbitrary()?;
+    Ok(match tag % 11 {
+        0 => Unit::None,
+        1 => Unit::Count,
+        2 => Unit::Percent,
+        3 => Unit::Second(NegativeScale::Micro),
+        4 => Unit::Second(NegativeScale::Milli),
+        5 => Unit::Second(NegativeScale::One),
+        6 => Unit::Byte(PositiveScale::One),
+        7 => Unit::Byte(PositiveScale::Kilo),
+        8 => Unit::Byte(PositiveScale::Mega),
+        9 => Unit::Bit(PositiveScale::One),
+        _ => Unit::Bit(PositiveScale::Kilo),
+    })
 }
 
-impl FuzzUnit {
-    fn to_unit(&self) -> Unit {
-        match self {
-            FuzzUnit::None => Unit::None,
-            FuzzUnit::Count => Unit::Count,
-            FuzzUnit::Percent => Unit::Percent,
-            FuzzUnit::SecondMicro => Unit::Second(NegativeScale::Micro),
-            FuzzUnit::SecondMilli => Unit::Second(NegativeScale::Milli),
-            FuzzUnit::Second => Unit::Second(NegativeScale::One),
-            FuzzUnit::Byte => Unit::Byte(PositiveScale::One),
-            FuzzUnit::KiloByte => Unit::Byte(PositiveScale::Kilo),
-            FuzzUnit::MegaByte => Unit::Byte(PositiveScale::Mega),
-            FuzzUnit::Bit => Unit::Bit(PositiveScale::One),
-            FuzzUnit::KiloBit => Unit::Bit(PositiveScale::Kilo),
-        }
-    }
-}
-
-impl<'a> Arbitrary<'a> for FuzzUnit {
-    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let tag: u8 = u.arbitrary()?;
-        Ok(match tag % 11 {
-            0 => FuzzUnit::None,
-            1 => FuzzUnit::Count,
-            2 => FuzzUnit::Percent,
-            3 => FuzzUnit::SecondMicro,
-            4 => FuzzUnit::SecondMilli,
-            5 => FuzzUnit::Second,
-            6 => FuzzUnit::Byte,
-            7 => FuzzUnit::KiloByte,
-            8 => FuzzUnit::MegaByte,
-            9 => FuzzUnit::Bit,
-            _ => FuzzUnit::KiloBit,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum FuzzMetricFlagMode {
-    None,
-    HighStorageResolution,
-    NoMetric,
-    HighThenNoMetric,
-    NoMetricThenHigh,
-}
-
-impl<'a> Arbitrary<'a> for FuzzMetricFlagMode {
-    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        let tag: u8 = u.arbitrary()?;
-        Ok(match tag % 5 {
-            0 => FuzzMetricFlagMode::None,
-            1 => FuzzMetricFlagMode::HighStorageResolution,
-            2 => FuzzMetricFlagMode::NoMetric,
-            3 => FuzzMetricFlagMode::HighThenNoMetric,
-            _ => FuzzMetricFlagMode::NoMetricThenHigh,
-        })
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Arbitrary)]
 pub struct FuzzTimestamp {
     pub before_epoch: bool,
     pub secs: u64,
 }
 
 impl FuzzTimestamp {
-    fn to_system_time(&self) -> SystemTime {
+    pub fn to_system_time(&self) -> SystemTime {
         // Keep values bounded to avoid pathological durations.
         let secs = self.secs % (365 * 500 * 24 * 3600);
         let duration = Duration::from_secs(secs);
@@ -168,16 +109,11 @@ impl FuzzTimestamp {
     }
 }
 
-impl<'a> Arbitrary<'a> for FuzzTimestamp {
-    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(Self {
-            before_epoch: u.arbitrary()?,
-            secs: u.arbitrary()?,
-        })
-    }
-}
-
 /// Fuzzed entry that exercises the full `EntryWriter` interface.
+///
+/// This is a format-agnostic entry: it writes metrics directly without
+/// format-specific wrappers (like EMF flags). Format-specific fuzz targets
+/// can wrap this to add their own behavior.
 #[derive(Debug)]
 pub struct FuzzEntry {
     pub timestamps: Vec<FuzzTimestamp>,
@@ -207,44 +143,23 @@ impl Entry for FuzzEntry {
                     observations,
                     dimensions,
                     unit,
-                    flag_mode,
                 } => {
                     let metric = FuzzMetricValue {
                         observations,
                         dimensions,
                         unit: *unit,
                     };
-                    match flag_mode {
-                        FuzzMetricFlagMode::None => writer.value(name.as_str(), &metric),
-                        FuzzMetricFlagMode::HighStorageResolution => {
-                            writer.value(name.as_str(), &HighStorageResolution::from(metric));
-                        }
-                        FuzzMetricFlagMode::NoMetric => {
-                            writer.value(name.as_str(), &NoMetric::from(metric));
-                        }
-                        FuzzMetricFlagMode::HighThenNoMetric => {
-                            writer.value(
-                                name.as_str(),
-                                &NoMetric::from(HighStorageResolution::from(metric)),
-                            );
-                        }
-                        FuzzMetricFlagMode::NoMetricThenHigh => {
-                            writer.value(
-                                name.as_str(),
-                                &HighStorageResolution::from(NoMetric::from(metric)),
-                            );
-                        }
-                    }
+                    writer.value(name.as_str(), &metric);
                 }
             }
         }
     }
 }
 
-struct FuzzMetricValue<'a> {
-    observations: &'a [FuzzObservation],
-    dimensions: &'a [(String, String)],
-    unit: FuzzUnit,
+pub struct FuzzMetricValue<'a> {
+    pub observations: &'a [FuzzObservation],
+    pub dimensions: &'a [(String, String)],
+    pub unit: Unit,
 }
 
 impl metrique_writer_core::value::Value for FuzzMetricValue<'_> {
@@ -253,7 +168,7 @@ impl metrique_writer_core::value::Value for FuzzMetricValue<'_> {
             self.observations
                 .iter()
                 .map(FuzzObservation::to_observation),
-            self.unit.to_unit(),
+            self.unit,
             self.dimensions
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
@@ -363,13 +278,14 @@ fn arbitrary_field<'a>(
             name,
             observations,
             dimensions,
-            unit: u.arbitrary()?,
-            flag_mode: u.arbitrary()?,
+            unit: arbitrary_unit(u)?,
         })
     }
 }
 
-fn arbitrary_entry_dimensions<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<EntryDimensions> {
+pub fn arbitrary_entry_dimensions<'a>(
+    u: &mut Unstructured<'a>,
+) -> arbitrary::Result<EntryDimensions> {
     let set_count = match u.arbitrary::<u8>()? % 6 {
         0 => 0,
         1 => 1,
@@ -397,7 +313,7 @@ fn arbitrary_entry_dimensions<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result
     Ok(EntryDimensions::new(Cow::Owned(sets)))
 }
 
-fn arbitrary_string<'a>(u: &mut Unstructured<'a>, max_len: usize) -> arbitrary::Result<String> {
+pub fn arbitrary_string<'a>(u: &mut Unstructured<'a>, max_len: usize) -> arbitrary::Result<String> {
     let len = (u.arbitrary::<u8>()? as usize).min(max_len);
     let mut s = String::with_capacity(len);
     for _ in 0..len {
@@ -406,7 +322,7 @@ fn arbitrary_string<'a>(u: &mut Unstructured<'a>, max_len: usize) -> arbitrary::
     Ok(s)
 }
 
-fn arbitrary_char<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<char> {
+pub fn arbitrary_char<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<char> {
     const JSON_ESCAPES: [char; 6] = ['"', '\\', '\n', '\r', '\t', '\u{08}'];
     const DELIMS: [char; 6] = ['{', '}', '[', ']', ':', ','];
     let bucket: u8 = u.arbitrary()?;
@@ -428,7 +344,7 @@ fn arbitrary_char<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<char> {
     }
 }
 
-fn arbitrary_f64<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<f64> {
+pub fn arbitrary_f64<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<f64> {
     let choice: u8 = u.arbitrary()?;
     Ok(match choice % 12 {
         0 => f64::NAN,
@@ -444,7 +360,7 @@ fn arbitrary_f64<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<f64> {
     })
 }
 
-fn chance_percent<'a>(u: &mut Unstructured<'a>, percent: u8) -> arbitrary::Result<bool> {
+pub fn chance_percent<'a>(u: &mut Unstructured<'a>, percent: u8) -> arbitrary::Result<bool> {
     debug_assert!(percent <= 100);
     if percent == 0 {
         return Ok(false);
@@ -456,7 +372,23 @@ fn chance_percent<'a>(u: &mut Unstructured<'a>, percent: u8) -> arbitrary::Resul
     Ok(roll < percent)
 }
 
-fn choose_index<'a>(u: &mut Unstructured<'a>, len: usize) -> arbitrary::Result<usize> {
+pub fn choose_index<'a>(u: &mut Unstructured<'a>, len: usize) -> arbitrary::Result<usize> {
     debug_assert!(len > 0);
     u.int_in_range(0..=len - 1)
+}
+
+/// Generate a fuzzed sample rate with bias toward edge cases.
+pub fn arbitrary_sample_rate<'a>(u: &mut Unstructured<'a>) -> arbitrary::Result<f32> {
+    let selector: u8 = u.arbitrary()?;
+    Ok(match selector % 10 {
+        0 => f32::NAN,
+        1 => 0.0,
+        2 => -1.0,
+        3 => f32::INFINITY,
+        4 => 1.0,
+        5 => 0.5,
+        6 => 0.001,
+        7 => 1e-30,
+        _ => f32::from_bits(u.arbitrary()?),
+    })
 }
