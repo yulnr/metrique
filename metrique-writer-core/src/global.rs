@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use crate::{
     EntrySink,
     entry::BoxEntry,
-    sink::{AppendOnDrop, BoxEntrySink},
+    sink::{AppendOnDrop, BoxEntrySink, WeakEntrySink},
 };
 
 use super::Entry;
@@ -241,6 +241,13 @@ pub trait AttachGlobalEntrySink {
 #[must_use = "if unused the global sink will be immediately detached and shut down"]
 pub struct AttachHandle {
     join: Option<fn()>,
+    // Weak reference to the attached sink. Upgradeable as long as the sink is alive.
+    //
+    // Prototype note: this bypasses test-sink overrides (thread-local / runtime-scoped)
+    // since the weak ref points directly at the underlying Arc. An alternative I tried was a
+    // fn pointer (`fn() -> Option<BoxEntrySink>`) that goes through the full resolution
+    // chain, but that only works for macro-created sinks.
+    weak_sink: Option<WeakEntrySink>,
 }
 
 /// Guard that manages the lifecycle of a thread-local test sink override.
@@ -324,8 +331,11 @@ impl Drop for AttachHandle {
 impl AttachHandle {
     // pub so it can be accessed through macro
     #[doc(hidden)]
-    pub fn new(join: fn()) -> Self {
-        Self { join: Some(join) }
+    pub fn new(join: fn(), weak_sink: Option<WeakEntrySink>) -> Self {
+        Self {
+            join: Some(join),
+            weak_sink,
+        }
     }
 
     /// Cause the attached global sink to remain attached forever.
@@ -334,6 +344,11 @@ impl AttachHandle {
     /// shutdown. You *must* have another mechanism to ensure metrics are flushed.
     pub fn forget(mut self) {
         self.join = None;
+    }
+
+    /// Return a clone of the attached sink, if still attached.
+    pub fn try_sink(&self) -> Option<BoxEntrySink> {
+        self.weak_sink.as_ref().and_then(|weak| weak.upgrade())
     }
 }
 
@@ -485,10 +500,12 @@ macro_rules! global_entry_sink {
                     if write.is_some() {
                         drop(write); // don't poison
                         panic!("Already installed a global {NAME} sink, drop the attach handle first if intentionally attaching a new sink");
-                    } else {
-                        *write = Some((BoxEntrySink::new(sink), Box::new(handle)));
                     }
-                    AttachHandle::new(|| { SINK.write().unwrap().take(); })
+                    let sink = BoxEntrySink::new(sink);
+                    let weak = sink.downgrade();
+                    *write = Some((sink, Box::new(handle)));
+                    drop(write);
+                    AttachHandle::new(|| { SINK.write().unwrap().take(); }, Some(weak))
                 }
 
                 fn try_sink() -> Option<BoxEntrySink> {
