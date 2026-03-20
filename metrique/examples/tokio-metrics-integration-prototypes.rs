@@ -76,8 +76,8 @@ fn approach_b_composite_attach_handle() -> CompositeAttachHandle {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
-    // Comment out one of these approches to try the other one. 
-    
+    // Comment out one of these approches to try the other one.
+
     // Approach A:
     // Two handles: reporter + attach_handle. Both must stay alive.
     let (_reporter, _attach_handle) = approach_a_sink_extension();
