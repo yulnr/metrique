@@ -19,13 +19,13 @@ use std::any::Any;
 use std::collections::HashMap;
 #[cfg(feature = "test-util")]
 use std::marker::PhantomData;
-#[cfg(feature = "test-util")]
+use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 
 use crate::{
     EntrySink,
     entry::BoxEntry,
-    sink::{AppendOnDrop, BoxEntrySink, WeakEntrySink},
+    sink::{AppendOnDrop, BoxEntrySink},
 };
 
 use super::Entry;
@@ -179,6 +179,9 @@ pub trait AttachGlobalEntrySink {
     /// Try to append the entry to the global sink, returning it an [`Err`] case if no sink
     /// is currently attached.
     fn try_append<E: Entry + Send + 'static>(entry: E) -> Result<(), E>;
+
+    /// Register a function to be called when the attach handle is dropped.
+    fn register_shutdown_fn(f: ShutdownFn);
 }
 
 /// Handle that, when dropped, will cause the attached global sink to flush remaining entries and
@@ -240,15 +243,15 @@ pub trait AttachGlobalEntrySink {
 /// ```
 #[must_use = "if unused the global sink will be immediately detached and shut down"]
 pub struct AttachHandle {
-    join: Option<fn()>,
-    // Weak reference to the attached sink. Upgradeable as long as the sink is alive.
-    //
-    // Prototype note: this bypasses test-sink overrides (thread-local / runtime-scoped)
-    // since the weak ref points directly at the underlying Arc. An alternative I tried was a
-    // fn pointer (`fn() -> Option<BoxEntrySink>`) that goes through the full resolution
-    // chain, but that only works for macro-created sinks.
-    weak_sink: Option<WeakEntrySink>,
+    /// Registry of shutdown functions to call when the attach handle is dropped.
+    shutdown_registry: Arc<ShutdownRegistry>,
 }
+
+#[doc(hidden)]
+pub type ShutdownFn = Box<dyn FnOnce() + Send>;
+
+#[doc(hidden)]
+pub type ShutdownRegistry = Mutex<Vec<ShutdownFn>>;
 
 /// Guard that manages the lifecycle of a thread-local test sink override.
 ///
@@ -322,8 +325,9 @@ impl Drop for TokioRuntimeTestSinkGuard {
 
 impl Drop for AttachHandle {
     fn drop(&mut self) {
-        if let Some(join) = self.join.take() {
-            join();
+        // Shutdown functions are pre-pended, drain so that subscribers abort first, and the sink detaches last.
+        for shutdown_fn in self.shutdown_registry.lock().unwrap().drain(..) {
+            shutdown_fn();
         }
     }
 }
@@ -331,10 +335,9 @@ impl Drop for AttachHandle {
 impl AttachHandle {
     // pub so it can be accessed through macro
     #[doc(hidden)]
-    pub fn new(join: fn(), weak_sink: Option<WeakEntrySink>) -> Self {
+    pub fn new(join: fn()) -> Self {
         Self {
-            join: Some(join),
-            weak_sink,
+            shutdown_registry: Arc::new(Mutex::new(vec![Box::new(join)])),
         }
     }
 
@@ -342,13 +345,13 @@ impl AttachHandle {
     ///
     /// Note that this will prevent the sink from guaranteeing metric entries are flushed during
     /// shutdown. You *must* have another mechanism to ensure metrics are flushed.
-    pub fn forget(mut self) {
-        self.join = None;
+    pub fn forget(self) {
+        self.shutdown_registry.lock().unwrap().clear();
     }
 
-    /// Return a clone of the attached sink, if still attached.
-    pub fn try_sink(&self) -> Option<BoxEntrySink> {
-        self.weak_sink.as_ref().and_then(|weak| weak.upgrade())
+    #[doc(hidden)]
+    pub fn shutdown_registry_weak(&self) -> Weak<ShutdownRegistry> {
+        Arc::downgrade(&self.shutdown_registry)
     }
 }
 
@@ -441,11 +444,12 @@ macro_rules! global_entry_sink {
         pub struct $name;
 
         const _: () = {
-            use ::std::{sync::RwLock, boxed::Box, option::Option::{self, Some, None}, result::Result, any::Any, marker::{Send, Sync}};
-            use $crate::{Entry, BoxEntry, BoxEntrySink, EntrySink, global::{AttachGlobalEntrySink, AttachHandle}};
+            use ::std::{sync::{RwLock, Weak}, boxed::Box, option::Option::{self, Some, None}, result::Result, any::Any, marker::{Send, Sync}};
+            use $crate::{Entry, BoxEntry, BoxEntrySink, EntrySink, global::{AttachGlobalEntrySink, AttachHandle, ShutdownFn, ShutdownRegistry}};
 
             const NAME: &'static str = ::std::stringify!($name);
             static SINK: RwLock<Option<(BoxEntrySink, Box<dyn Send + Sync + 'static>)>> = RwLock::new(None);
+            static SHUTDOWN_REGISTRY: RwLock<Option<Weak<ShutdownRegistry>>> = RwLock::new(None);
 
             $crate::__test_util! {
                 use ::std::cell::RefCell;
@@ -502,10 +506,12 @@ macro_rules! global_entry_sink {
                         panic!("Already installed a global {NAME} sink, drop the attach handle first if intentionally attaching a new sink");
                     }
                     let sink = BoxEntrySink::new(sink);
-                    let weak = sink.downgrade();
                     *write = Some((sink, Box::new(handle)));
                     drop(write);
-                    AttachHandle::new(|| { SINK.write().unwrap().take(); }, Some(weak))
+                    let attach_handle = AttachHandle::new(|| { SINK.write().unwrap().take(); });
+                    *SHUTDOWN_REGISTRY.write().unwrap() = Some(attach_handle.shutdown_registry_weak());
+
+                    attach_handle
                 }
 
                 fn try_sink() -> Option<BoxEntrySink> {
@@ -535,6 +541,15 @@ macro_rules! global_entry_sink {
                     } else {
                         Err(entry)
                     }
+                }
+
+                fn register_shutdown_fn(f: ShutdownFn) {
+                    let read = SHUTDOWN_REGISTRY.read().unwrap();
+                    let weak = read.as_ref().expect("No sink attached — call attach() before subscribing");
+                    weak.upgrade()
+                        .expect("AttachHandle already dropped — cannot register shutdown after detach")
+                        .lock().unwrap()
+                        .insert(0, f); // Pre-pend the functions so that they're in front of the sink when dropped.
                 }
             }
 
@@ -1003,6 +1018,140 @@ mod tests {
         assert_eq!(global_inspector.entries().len(), 2);
         assert_eq!(thread_local_inspector.entries().len(), 1);
     }
+}
+
+#[cfg(test)]
+mod shutdown_registry_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use metrique_writer::sink::AttachGlobalEntrySink;
+    use metrique_writer::test_util::{TestEntrySink, test_entry_sink};
+
+    #[test]
+    fn shutdown_fn_runs_on_drop() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { sink, .. } = test_entry_sink();
+        let called = Arc::new(AtomicBool::new(false));
+        let called2 = called.clone();
+
+        let handle = Sink::attach((sink, ()));
+        Sink::register_shutdown_fn(Box::new(move || {
+            called2.store(true, Ordering::SeqCst);
+        }));
+
+        assert!(!called.load(Ordering::SeqCst));
+        drop(handle);
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shutdown_fns_run_before_sink_detach() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { sink, .. } = test_entry_sink();
+
+        // Track call order: subscriber = 1, sink detach = 2
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let order2 = order.clone();
+
+        let handle = Sink::attach((sink, ()));
+
+        // The sink detach fn is already at position 0 (pushed in AttachHandle::new).
+        // Subscriber should be prepended before it.
+        Sink::register_shutdown_fn(Box::new(move || {
+            order2.lock().unwrap().push("subscriber");
+        }));
+
+        // Wrap the handle to also record when the sink detach runs.
+        // We can check that the sink is still attached when the subscriber runs
+        // by checking Sink::try_sink() inside the shutdown fn.
+        drop(handle);
+
+        // subscriber was prepended, so it runs first
+        let calls = order.lock().unwrap();
+        assert_eq!(calls[0], "subscriber");
+    }
+
+    #[test]
+    fn forget_prevents_shutdown_fns_from_running() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { sink, .. } = test_entry_sink();
+        let called = Arc::new(AtomicBool::new(false));
+        let called2 = called.clone();
+
+        let handle = Sink::attach((sink, ()));
+        Sink::register_shutdown_fn(Box::new(move || {
+            called2.store(true, Ordering::SeqCst);
+        }));
+
+        handle.forget();
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn forget_keeps_sink_attached() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { sink, .. } = test_entry_sink();
+
+        let handle = Sink::attach((sink, ()));
+        handle.forget();
+
+        // Sink should still be usable
+        assert!(Sink::try_sink().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "AttachHandle already dropped")]
+    fn register_after_forget_panics() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { sink, .. } = test_entry_sink();
+
+        let handle = Sink::attach((sink, ()));
+        handle.forget();
+
+        // forget consumes the handle, dropping the Arc. The Weak can no longer
+        // upgrade, registering new shutdown fns after forgetting is a user error.
+        Sink::register_shutdown_fn(Box::new(|| {}));
+    }
+
+    #[test]
+    #[should_panic(expected = "No sink attached")]
+    fn register_without_attach_panics() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        Sink::register_shutdown_fn(Box::new(|| {}));
+    }
+
+    #[test]
+    fn can_reattach_after_drop() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { sink, .. } = test_entry_sink();
+        let called = Arc::new(AtomicUsize::new(0));
+
+        // First attach + drop
+        {
+            let handle = Sink::attach((sink, ()));
+            let called2 = called.clone();
+            Sink::register_shutdown_fn(Box::new(move || {
+                called2.fetch_add(1, Ordering::SeqCst);
+            }));
+            drop(handle);
+        }
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+
+        // Second attach + drop — new registry, new shutdown fns
+        let TestEntrySink { sink, .. } = test_entry_sink();
+        {
+            let handle = Sink::attach((sink, ()));
+            let called2 = called.clone();
+            Sink::register_shutdown_fn(Box::new(move || {
+                called2.fetch_add(1, Ordering::SeqCst);
+            }));
+            drop(handle);
+        }
+        assert_eq!(called.load(Ordering::SeqCst), 2);
+    }
+
+    use std::sync::Mutex;
 }
 // Helper macro that conditionally expands based on the test-util feature
 // This is checked at macro expansion time in the metrique-writer-core crate

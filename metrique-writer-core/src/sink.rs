@@ -10,7 +10,7 @@ use std::{
     fmt::Debug,
     ops::{Deref, DerefMut},
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use crate::{Entry, entry::BoxEntry};
@@ -132,36 +132,6 @@ impl BoxEntrySink {
     /// Create a new [BoxEntrySink]
     pub fn new(sink: impl EntrySink<BoxEntry> + Send + Sync + 'static) -> Self {
         Self(Arc::new(Box::new(sink)))
-    }
-
-    /// Create a weak reference to this sink.
-    ///
-    /// The weak reference can be upgraded back to a [`BoxEntrySink`] as long as
-    /// at least one strong reference (clone) remains alive.
-    pub fn downgrade(&self) -> WeakEntrySink {
-        WeakEntrySink(Arc::downgrade(&self.0))
-    }
-}
-
-/// A weak reference to a [`BoxEntrySink`].
-///
-/// Created by [`BoxEntrySink::downgrade`]. Can be upgraded back to a
-/// [`BoxEntrySink`] if the underlying sink is still alive.
-#[derive(Clone)]
-pub struct WeakEntrySink(Weak<Box<dyn EntrySink<BoxEntry> + Send + Sync + 'static>>);
-
-impl WeakEntrySink {
-    /// Attempt to upgrade this weak reference to a [`BoxEntrySink`].
-    ///
-    /// Returns `None` if the underlying sink has been dropped.
-    pub fn upgrade(&self) -> Option<BoxEntrySink> {
-        self.0.upgrade().map(BoxEntrySink)
-    }
-}
-
-impl Debug for WeakEntrySink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("WeakEntrySink").finish()
     }
 }
 

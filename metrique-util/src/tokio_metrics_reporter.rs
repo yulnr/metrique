@@ -1,14 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
+use metrique_writer_core::global::{AttachGlobalEntrySink, GlobalEntrySink};
 use metrique_writer_core::{BoxEntrySink, EntrySink};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio_metrics::RuntimeMonitor;
-
-use crate::reporter::{CompositeAttachHandle, MetricReporter};
 
 const DEFAULT_METRIC_SAMPLING_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -36,83 +35,51 @@ impl TokioRuntimeMetricsConfig {
     }
 }
 
-/// Handle for a Tokio runtime metrics subscription.
-///
-/// Keep this alive while metrics should continue being collected and appended.
-#[must_use = "if unused the reporter task will be aborted immediately"]
-pub struct TokioRuntimeMetricsReporter {
-    reporter_task: Option<JoinHandle<()>>,
-}
-
-impl fmt::Debug for TokioRuntimeMetricsReporter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TokioRuntimeMetricsReporter").finish()
-    }
-}
-
-impl TokioRuntimeMetricsReporter {
-    fn new(reporter_task: JoinHandle<()>) -> Self {
-        Self {
-            reporter_task: Some(reporter_task),
-        }
-    }
-}
-
-impl MetricReporter for TokioRuntimeMetricsReporter {
-    fn abort(&mut self) {
-        if let Some(task) = self.reporter_task.take() {
+/// Extension methods for subscribing Tokio runtime metrics to a global entry sink.
+pub trait AttachGlobalEntrySinkTokioMetricsExt: AttachGlobalEntrySink + GlobalEntrySink {
+    /// Subscribe to Tokio runtime metrics, adding the subscription to this handle.
+    ///
+    /// The reporter task is automatically aborted when the [`AttachHandle`] is dropped.
+    ///
+    /// # Panics
+    /// Panics if the underlying sink has been detached (e.g. the `AttachHandle` was
+    /// dropped elsewhere before this call).
+    ///
+    /// [`AttachHandle`]: metrique_writer_core::global::AttachHandle
+    fn subscribe_tokio_runtime_metrics(config: TokioRuntimeMetricsConfig) {
+        let sink = Self::sink();
+        let task = spawn_tokio_runtime_metrics_task(sink, config);
+        Self::register_shutdown_fn(Box::new(move || {
             task.abort();
+        }));
+    }
+}
+
+impl<T: AttachGlobalEntrySink + GlobalEntrySink> AttachGlobalEntrySinkTokioMetricsExt for T {}
+
+fn spawn_tokio_runtime_metrics_task(sink: BoxEntrySink, config: TokioRuntimeMetricsConfig) -> JoinHandle<()> {
+    let interval = config.interval;
+    let reporter_task = tokio::spawn(async move {
+        tracing::debug!("tokio runtime metrics reporter started");
+        let handle = Handle::current();
+        let monitor = RuntimeMonitor::new(&handle);
+        for snapshot in monitor.intervals() {
+            // Take histogram counts before moving snapshot into append.
+            // Bucket ranges come from the runtime handle at format time.
+            #[cfg(tokio_unstable)]
+            let (snapshot, histogram_counts) = {
+                let mut snapshot = snapshot;
+                let counts = std::mem::take(&mut snapshot.poll_time_histogram);
+                (snapshot, counts)
+            };
+            sink.append(snapshot);
+            #[cfg(tokio_unstable)]
+            emit_poll_time_histogram(&sink, histogram_counts, handle.metrics());
+            tokio::time::sleep(interval).await;
         }
-    }
-
-    fn forget(&mut self) {
-        let _ = self.reporter_task.take();
-    }
-}
-
-impl Drop for TokioRuntimeMetricsReporter {
-    fn drop(&mut self) {
-        self.abort();
-    }
-}
-
-/// Extension methods for subscribing Tokio runtime metrics reporting on a sink.
-pub trait BoxEntrySinkTokioMetricsExt {
-    /// Start runtime metrics reporting with custom configuration.
-    fn subscribe_tokio_runtime_metrics(
-        self,
-        config: TokioRuntimeMetricsConfig,
-    ) -> TokioRuntimeMetricsReporter;
-}
-
-impl BoxEntrySinkTokioMetricsExt for BoxEntrySink {
-    fn subscribe_tokio_runtime_metrics(
-        self,
-        config: TokioRuntimeMetricsConfig,
-    ) -> TokioRuntimeMetricsReporter {
-        let interval = config.interval;
-        let reporter_task = tokio::spawn(async move {
-            tracing::debug!("tokio runtime metrics reporter started");
-            let handle = Handle::current();
-            let monitor = RuntimeMonitor::new(&handle);
-            for snapshot in monitor.intervals() {
-                // Take histogram counts before moving snapshot into append.
-                // Bucket ranges come from the runtime handle at format time.
-                #[cfg(tokio_unstable)]
-                let (snapshot, histogram_counts) = {
-                    let mut snapshot = snapshot;
-                    let counts = std::mem::take(&mut snapshot.poll_time_histogram);
-                    (snapshot, counts)
-                };
-                self.append(snapshot);
-                #[cfg(tokio_unstable)]
-                emit_poll_time_histogram(&self, histogram_counts, handle.metrics());
-                tokio::time::sleep(interval).await;
-            }
-            tracing::debug!("tokio runtime metrics reporter stopped");
-        });
-        TokioRuntimeMetricsReporter::new(reporter_task)
-    }
+        tracing::debug!("tokio runtime metrics reporter stopped");
+    });
+    reporter_task
 }
 
 /// Emit `poll_time_histogram` bucket counts as a metrique distribution metric,
@@ -126,13 +93,10 @@ fn emit_poll_time_histogram(
     use metrique_writer_core::value::MetricFlags;
     use metrique_writer_core::{Entry, EntryWriter, Observation, Unit, unit::NegativeScale};
 
-    // Prototype note: Emitted as a separate entry alongside RuntimeMetrics because
+    // Emitted as a separate entry alongside RuntimeMetrics because
     // `poll_time_histogram` uses #[entry(ignore)] on RuntimeMetrics — the raw
     // Vec<u64> counts need bucket ranges from the runtime handle to be
     // meaningful, which Entry::write() doesn't have access to.
-    //
-    // If a single entry is preferred, this could be wrapped into a struct
-    // that flattens RuntimeMetrics and adds the enriched histogram field.
     struct PollTimeHistogramEntry {
         counts: Vec<u64>,
         rt: tokio::runtime::RuntimeMetrics,
@@ -170,23 +134,55 @@ fn emit_poll_time_histogram(
     sink.append(PollTimeHistogramEntry { counts, rt });
 }
 
-/// Extension methods for composing Tokio runtime metrics with a [`CompositeAttachHandle`].
-pub trait CompositeAttachHandleTokioMetricsExt {
-    /// Subscribe to Tokio runtime metrics, adding the subscription to this handle.
-    ///
-    /// # Panics
-    /// Panics if the underlying sink has been detached (e.g. the `AttachHandle` was
-    /// dropped elsewhere before this call).
-    fn with_tokio_runtime_metrics(self, config: TokioRuntimeMetricsConfig) -> Self;
-}
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-impl CompositeAttachHandleTokioMetricsExt for CompositeAttachHandle {
-    fn with_tokio_runtime_metrics(mut self, config: TokioRuntimeMetricsConfig) -> Self {
-        let sink = self
-            .try_sink()
-            .expect("sink must still be attached before subscribing tokio runtime metrics");
-        let sub = sink.subscribe_tokio_runtime_metrics(config);
-        self.add_reporter(sub);
-        self
+    use metrique_writer::sink::AttachGlobalEntrySink;
+    use metrique_writer::test_util::{TestEntrySink, test_entry_sink};
+
+    use super::{AttachGlobalEntrySinkTokioMetricsExt, TokioRuntimeMetricsConfig};
+
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_appends_metrics() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { inspector, sink } = test_entry_sink();
+        let _handle = Sink::attach((sink, ()));
+
+        Sink::subscribe_tokio_runtime_metrics(
+            TokioRuntimeMetricsConfig::default().with_interval(Duration::from_millis(50)),
+        );
+
+        // Advance past a few intervals so the reporter loop emits entries.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !inspector.entries().is_empty(),
+            "expected tokio runtime metrics entries"
+        );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_aborted_on_handle_drop() {
+        metrique_writer::sink::global_entry_sink! { Sink }
+        let TestEntrySink { inspector, sink } = test_entry_sink();
+        let handle = Sink::attach((sink, ()));
+
+        Sink::subscribe_tokio_runtime_metrics(
+            TokioRuntimeMetricsConfig::default().with_interval(Duration::from_millis(50)),
+        );
+
+        // Let some entries accumulate.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let count_before = inspector.entries().len();
+        assert!(count_before > 0);
+
+        // Drop the attach handle — this should abort the reporter task.
+        drop(handle);
+
+        // Advance time further; no new entries should appear.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(inspector.entries().len(), count_before);
+    }
+
 }

@@ -86,7 +86,7 @@ name = "json"
 required-features = ["json"]
 
 [[example]]
-name = "tokio-metrics-integration-prototypes"
+name = "tokio-metrics-integration"
 required-features = ["emf", "service-metrics"]
 doc-scrape-examples = false
 
