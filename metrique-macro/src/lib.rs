@@ -23,6 +23,7 @@ use emf::DimensionSets;
 use inflect::NameStyle;
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as Ts2};
+use quote::format_ident;
 use quote::{ToTokens, quote, quote_spanned};
 use syn::{
     Attribute, Data, DeriveInput, Error, Fields, GenericParam, Generics, Ident, Result, Type,
@@ -915,8 +916,13 @@ pub(crate) fn parse_metric_fields(
             None => (quote! { #i }, None, field.ty.span()),
         };
 
+        // Unwrap `#[cfg_attr(COND, metrics(...))]` into `#[metrics(...)]` so darling
+        // can recognize field-level metrics attributes even when cfg-gated.
+        let mut field = field.clone();
+        unwrap_cfg_attr_metrics(&mut field.attrs);
+
         let attrs = match errors
-            .handle(RawMetricsFieldAttrs::from_field(field).and_then(|attr| attr.validate()))
+            .handle(RawMetricsFieldAttrs::from_field(&field).and_then(|attr| attr.validate()))
         {
             Some(attrs) => attrs,
             None => {
@@ -1088,6 +1094,17 @@ pub(crate) struct MetricsField {
 }
 
 impl MetricsField {
+    /// Extract `#[cfg(...)]` and `#[cfg_attr(...)]` attributes from this field's external attrs.
+    /// These must be propagated to any generated code that accesses this field.
+    pub(crate) fn cfg_attrs(&self) -> Vec<&Attribute> {
+        self.external_attrs
+            .iter()
+            .filter(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+            .collect()
+    }
+}
+
+impl MetricsField {
     fn core_field(&self, is_named: bool) -> Ts2 {
         let MetricsField {
             ref external_attrs,
@@ -1126,7 +1143,9 @@ impl MetricsField {
         } else {
             quote! { #base_type }
         };
+        let cfg_attrs = self.cfg_attrs();
         Some(quote_spanned! { *span=>
+                #(#cfg_attrs)*
                 #[deprecated(note = "these fields will become private in a future release. To introspect an entry, use `metrique::writer::test_util::test_entry`")]
                 #[doc(hidden)]
                 #inner
@@ -1140,12 +1159,12 @@ impl MetricsField {
         }
     }
 
-    pub(crate) fn close_value(&self, ownership_kind: OwnershipKind) -> Ts2 {
+    pub(crate) fn close_value(&self, ownership_kind: OwnershipKind, self_ident: &Ts2) -> Ts2 {
         let ident = &self.ident;
         let span = self.span;
         let field_expr = match ownership_kind {
-            OwnershipKind::ByValue => quote_spanned! {span=> self.#ident },
-            OwnershipKind::ByRef => quote_spanned! {span=> &self.#ident },
+            OwnershipKind::ByValue => quote_spanned! {span=> #self_ident.#ident },
+            OwnershipKind::ByRef => quote_spanned! {span=> &#self_ident.#ident },
         };
         self.close_field_expr(field_expr)
     }
@@ -1167,7 +1186,8 @@ impl MetricsField {
             base
         };
 
-        quote! { #ident: #base }
+        let cfg_attrs = self.cfg_attrs();
+        quote! { #(#cfg_attrs)* #ident: #base }
     }
 }
 
@@ -1487,6 +1507,8 @@ fn generate_close_value_impls(
     impl_body: Ts2,
 ) -> Ts2 {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let mixed = proc_macro2::Span::mixed_site();
+    let this = format_ident!("__metrique_this", span = mixed);
 
     let (metrics_struct_ty, proxy_impl) = match root_attrs.ownership_kind() {
         OwnershipKind::ByValue => (quote!(#base_ty #ty_generics), quote!()),
@@ -1501,12 +1523,20 @@ fn generate_close_value_impls(
             }),
         ),
     };
+
+    // Use quote_spanned!(mixed_site) for the close method so that `self` gets the right span,
+    // then immediately rebind to a regular identifier that the impl_body can reference.
+    let close_fn = quote_spanned! {mixed=>
+        fn close(self) -> Self::Closed {
+            let #this = self;
+            #impl_body
+        }
+    };
+
     quote! {
         impl #impl_generics metrique::CloseValue for #metrics_struct_ty #where_clause {
             type Closed = #closed_ty #ty_generics;
-            fn close(self) -> Self::Closed {
-                #impl_body
-            }
+            #close_fn
         }
 
         #proxy_impl
@@ -1516,8 +1546,45 @@ fn generate_close_value_impls(
 pub(crate) fn clean_attrs(attr: &[Attribute]) -> Vec<Attribute> {
     attr.iter()
         .filter(|attr| !attr.path().is_ident("metrics"))
+        .filter(|attr| !is_cfg_attr_wrapping_metrics(attr))
         .cloned()
         .collect()
+}
+
+/// Check if an attribute is `#[cfg_attr(COND, metrics(...))]`.
+fn is_cfg_attr_wrapping_metrics(attr: &Attribute) -> bool {
+    extract_metrics_from_cfg_attr(attr).is_some()
+}
+
+/// If `attr` is `#[cfg_attr(COND, metrics(...))]`, extract the inner `#[metrics(...)]` attribute.
+fn extract_metrics_from_cfg_attr(attr: &Attribute) -> Option<Attribute> {
+    if !attr.path().is_ident("cfg_attr") {
+        return None;
+    }
+    attr.parse_args_with(|input: syn::parse::ParseStream| {
+        // Skip the cfg condition and comma
+        let _condition: syn::Meta = input.parse()?;
+        let _comma: syn::Token![,] = input.parse()?;
+        // Parse the inner attribute as a Meta
+        let inner: syn::Meta = input.parse()?;
+        if inner.path().is_ident("metrics") {
+            // Reconstruct as a standalone attribute
+            Ok(Some(syn::parse_quote!(#[#inner])))
+        } else {
+            Ok(None)
+        }
+    })
+    .unwrap_or(None)
+}
+
+/// Transform `#[cfg_attr(COND, metrics(...))]` into `#[metrics(...)]` in-place,
+/// so darling can recognize field-level metrics attributes even when cfg-gated.
+fn unwrap_cfg_attr_metrics(attrs: &mut Vec<Attribute>) {
+    for attr in attrs.iter_mut() {
+        if let Some(inner) = extract_metrics_from_cfg_attr(attr) {
+            *attr = inner;
+        }
+    }
 }
 
 /// Minimal passthrough that strips #[metrics] attributes from struct fields.

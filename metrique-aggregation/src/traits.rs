@@ -317,9 +317,9 @@ pub struct AggregationResult<K, Agg> {
 impl<Ns: NameStyle, A: InflectableEntry<Ns>, B: InflectableEntry<Ns>> InflectableEntry<Ns>
     for AggregationResult<A, B>
 {
-    fn write<'a>(&'a self, w: &mut impl metrique_writer::EntryWriter<'a>) {
-        self.key.write(w);
-        self.aggregated.write(w);
+    fn write_fields<'a>(this: &'a Self, w: &mut impl metrique_writer::EntryWriter<'a>) {
+        this.key.write(w);
+        this.aggregated.write(w);
     }
 }
 

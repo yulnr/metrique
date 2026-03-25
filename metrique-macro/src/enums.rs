@@ -3,7 +3,7 @@
 
 use darling::{FromField, FromVariant};
 use proc_macro2::TokenStream as Ts2;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{Attribute, Generics, Ident, Result, Visibility, spanned::Spanned};
 
 use crate::{MetricMode, TupleData, generate_on_drop_wrapper};
@@ -269,7 +269,8 @@ pub(crate) fn generate_metrics_for_enum(
                 let variant_ident = &variant.ident;
                 quote::quote_spanned!(variant.ident.span()=> #enum_name::#variant_ident => #entry_name::#variant_ident)
             });
-            let variants_map = quote!(#[allow(deprecated)] match self { #(#variants_map),* });
+            let this = format_ident!("__metrique_this", span = proc_macro2::Span::mixed_site());
+            let variants_map = quote!(#[allow(deprecated)] match #this { #(#variants_map),* });
             crate::generate_close_value_impls(
                 &root_attrs,
                 enum_name,
@@ -421,7 +422,8 @@ fn generate_close_value_impl_for_enum(
         }
     });
 
-    let match_expr = quote!(#[allow(deprecated)] match self { #(#match_arms),* });
+    let this = format_ident!("__metrique_this", span = proc_macro2::Span::mixed_site());
+    let match_expr = quote!(#[allow(deprecated)] match #this { #(#match_arms),* });
 
     crate::generate_close_value_impls(root_attrs, enum_name, entry_name, generics, match_expr)
 }

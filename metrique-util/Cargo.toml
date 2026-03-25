@@ -27,7 +27,8 @@ arc-swap = { version = "1", optional = true }
 metrique-writer-core = { path = "../metrique-writer-core", version = "0.1.13", optional = true }
 tokio = { workspace = true, optional = true, features = ["time", "rt"] }
 # TODO: Update before merge, should point to tokio-metrics on crates.io
-tokio-metrics = { git = "https://github.com/yulnr/tokio-metrics", branch = "metrique-entry-support", optional = true, features = ["rt", "metrique-integration"] }
+#tokio-metrics = { git = "https://github.com/yulnr/tokio-metrics", branch = "metrique-entry-support", optional = true, features = ["rt", "metrique-integration"] }
+tokio-metrics = { path = "../../tokio-metrics", optional = true, features = ["rt", "metrique-integration"] }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]

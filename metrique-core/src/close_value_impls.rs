@@ -272,9 +272,9 @@ impl<T: CloseValueRef, F: FlagConstructor> CloseValue for &'_ ForceFlag<T, F> {
 impl<NS: crate::NameStyle, T: InflectableEntry<NS>, F: FlagConstructor> InflectableEntry<NS>
     for ForceFlag<T, F>
 {
-    fn write<'a>(&'a self, writer: &mut impl metrique_writer_core::EntryWriter<'a>) {
+    fn write_fields<'a>(this: &'a Self, writer: &mut impl metrique_writer_core::EntryWriter<'a>) {
         <T as InflectableEntry<NS>>::write(
-            self,
+            this,
             &mut ForceFlagEntryWriter {
                 writer,
                 phantom: PhantomData::<F>,
@@ -287,8 +287,8 @@ impl<NS: crate::NameStyle, T: InflectableEntry<NS>, F: FlagConstructor> Inflecta
 impl<NS: crate::NameStyle, T: InflectableEntry<NS>, const N: usize> InflectableEntry<NS>
     for WithDimensions<T, N>
 {
-    fn write<'a>(&'a self, writer: &mut impl metrique_writer_core::EntryWriter<'a>) {
-        <T as InflectableEntry<NS>>::write(self, &mut self.entry_writer_wrapper(writer))
+    fn write_fields<'a>(this: &'a Self, writer: &mut impl metrique_writer_core::EntryWriter<'a>) {
+        <T as InflectableEntry<NS>>::write(this, &mut this.entry_writer_wrapper(writer))
     }
 }
 

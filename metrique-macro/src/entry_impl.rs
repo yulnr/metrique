@@ -167,26 +167,30 @@ fn generate_field_writes(
     field_access: impl Fn(&Ts2) -> Ts2,
 ) -> Vec<Ts2> {
     let mut writes = Vec::new();
+    // Use mixed_site() for the `writer` identifier so it resolves correctly
+    // even when this proc macro is invoked from inside a macro_rules! macro.
+    let writer = format_ident!("writer", span = proc_macro2::Span::mixed_site());
 
     for field in fields {
         let field_span = field.span;
         let ns = make_ns(root_attrs.rename_all, field_span);
+        let cfg_attrs = field.cfg_attrs();
 
-        match &field.attrs.kind {
+        let write = match &field.attrs.kind {
             MetricsFieldKind::Timestamp(span) => {
                 let field_access = field_access(&field.ident);
-                writes.push(quote_spanned! {*span=>
+                quote_spanned! {*span=>
                     #[allow(clippy::useless_conversion)]
                     {
-                        ::metrique::writer::EntryWriter::timestamp(writer, (*#field_access).into());
+                        ::metrique::writer::EntryWriter::timestamp(#writer, (*#field_access).into());
                     }
-                });
+                }
             }
             MetricsFieldKind::FlattenEntry(span) => {
                 let field_access = field_access(&field.ident);
-                writes.push(quote_spanned! {*span=>
-                    ::metrique::writer::Entry::write(#field_access, writer);
-                });
+                quote_spanned! {*span=>
+                    ::metrique::writer::Entry::write(#field_access, #writer);
+                }
             }
             MetricsFieldKind::Flatten { span, prefix } => {
                 let (extra, ns) = match prefix {
@@ -194,10 +198,10 @@ fn generate_field_writes(
                     Some(prefix) => prefix.append_to(&ns, field_span),
                 };
                 let field_access = field_access(&field.ident);
-                writes.push(quote_spanned! {*span=>
+                quote_spanned! {*span=>
                     #extra
-                    ::metrique::InflectableEntry::<#ns>::write(#field_access, writer);
-                });
+                    ::metrique::InflectableEntry::<#ns>::write(#field_access, #writer);
+                }
             }
             MetricsFieldKind::Ignore(_) => {
                 continue;
@@ -206,16 +210,17 @@ fn generate_field_writes(
                 let (extra, name) = make_inflect_metric_name(root_attrs, field);
                 let field_access = field_access(&field.ident);
                 let value = crate::value_impl::format_value(format, field_span, field_access);
-                writes.push(quote_spanned! {field_span=>
-                    ::metrique::writer::EntryWriter::value(writer,
+                quote_spanned! {field_span=>
+                    ::metrique::writer::EntryWriter::value(#writer,
                         {
                             #extra
                             ::metrique::concat::const_str_value::<#name>()
                         }
                         , #value);
-                });
+                }
             }
-        }
+        };
+        writes.push(quote! { #(#cfg_attrs)* { #write } });
     }
 
     writes

@@ -260,9 +260,25 @@ impl<T: ?Sized + CloseValue<Closed: InflectableEntry>> CloseEntry for T {}
 /// [`EntrySink`]: metrique_writer_core::EntrySink
 pub trait InflectableEntry<NS: namestyle::NameStyle = namestyle::Identity> {
     /// Write this metric entry to an EntryWriter
-    fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>);
+    fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) {
+        Self::write_fields(self, w)
+    }
     /// Sample group
     fn sample_group(&self) -> impl Iterator<Item = SampleGroupElement> {
+        Self::sample_group_fields(self)
+    }
+
+    /// Implementation detail for the `#[metrics]` proc macro. Equivalent to [`write`](Self::write)
+    /// but takes `&Self` instead of `&self` to avoid macro hygiene issues with the `self` keyword
+    /// when `#[metrics]` is used inside a `macro_rules!` macro.
+    #[doc(hidden)]
+    fn write_fields<'a>(this: &'a Self, w: &mut impl EntryWriter<'a>);
+
+    /// Implementation detail for the `#[metrics]` proc macro. Equivalent to [`sample_group`](Self::sample_group)
+    /// but takes `&Self` instead of `&self`.
+    #[doc(hidden)]
+    fn sample_group_fields(this: &Self) -> impl Iterator<Item = SampleGroupElement> {
+        let _ = this;
         vec![].into_iter()
     }
 }

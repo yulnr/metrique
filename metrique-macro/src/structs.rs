@@ -163,10 +163,13 @@ fn generate_close_value_impls_for_struct(
     fields: &[MetricsField],
     root_attrs: &RootAttributes,
 ) -> Ts2 {
+    let mixed = proc_macro2::Span::mixed_site();
+    let this = format_ident!("__metrique_this", span = mixed);
+    let this_tokens: proc_macro2::TokenStream = quote!(#this);
     let fields = fields
         .iter()
         .filter(|f| !matches!(f.attrs.kind, MetricsFieldKind::Ignore(_)))
-        .map(|f| f.close_value(root_attrs.ownership_kind()));
+        .map(|f| f.close_value(root_attrs.ownership_kind(), &this_tokens));
     let config: Vec<Ts2> = root_attrs.create_configuration();
 
     let impl_body = quote! {

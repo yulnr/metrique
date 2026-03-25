@@ -39,7 +39,6 @@ use std::borrow::Cow;
 
 use metrique_core::{CloseValue, InflectableEntry, NameStyle};
 use metrique_writer::{Entry, EntryWriter, Value};
-use metrique_writer_core::entry::SampleGroupElement;
 
 /// A struct that allows dynamic specification of keys
 pub struct Flex<T> {
@@ -144,12 +143,8 @@ impl<T: Value> Entry for FlexEntry<T> {
 }
 
 impl<T: Value, NS: NameStyle> InflectableEntry<NS> for FlexEntry<T> {
-    fn write<'a>(&'a self, writer: &mut impl EntryWriter<'a>) {
-        writer.value(Cow::Borrowed(self.key.as_ref()), &self.value);
-    }
-
-    fn sample_group(&self) -> impl Iterator<Item = SampleGroupElement> {
-        vec![].into_iter()
+    fn write_fields<'a>(this: &'a Self, writer: &mut impl EntryWriter<'a>) {
+        writer.value(Cow::Borrowed(this.key.as_ref()), &this.value);
     }
 }
 

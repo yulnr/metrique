@@ -3,11 +3,33 @@
 
 use std::time::Duration;
 
+use metrique_core::{CloseValue, InflectableEntry};
 use metrique_writer_core::global::{AttachGlobalEntrySink, GlobalEntrySink};
-use metrique_writer_core::{BoxEntrySink, EntrySink};
+use metrique_writer_core::{BoxEntrySink, EntrySink, EntryWriter, entry::SampleGroupElement};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio_metrics::RuntimeMonitor;
+
+/// Minimal wrapper to convert an [`InflectableEntry`] into an [`Entry`](metrique_writer_core::Entry).
+struct RootEntry<M: InflectableEntry> {
+    inner: M,
+}
+
+impl<M: InflectableEntry> RootEntry<M> {
+    fn new(inner: M) -> Self {
+        Self { inner }
+    }
+}
+
+impl<M: InflectableEntry> metrique_writer_core::Entry for RootEntry<M> {
+    fn write<'a>(&'a self, w: &mut impl EntryWriter<'a>) {
+        self.inner.write(w)
+    }
+
+    fn sample_group(&self) -> impl Iterator<Item = SampleGroupElement> {
+        self.inner.sample_group()
+    }
+}
 
 const DEFAULT_METRIC_SAMPLING_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -75,7 +97,7 @@ fn spawn_tokio_runtime_metrics_task(
                 let counts = std::mem::take(&mut snapshot.poll_time_histogram);
                 (snapshot, counts)
             };
-            sink.append(snapshot);
+            sink.append(RootEntry::new(snapshot.close()));
             #[cfg(tokio_unstable)]
             emit_poll_time_histogram(&sink, histogram_counts, handle.metrics());
             tokio::time::sleep(interval).await;

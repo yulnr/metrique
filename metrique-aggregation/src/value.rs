@@ -129,7 +129,7 @@ impl metrique_core::CloseValue for NoKey {
 }
 
 impl<NS: metrique_core::NameStyle> metrique_core::InflectableEntry<NS> for NoKey {
-    fn write<'a>(&'a self, _w: &mut impl metrique_writer::EntryWriter<'a>) {}
+    fn write_fields<'a>(_this: &'a Self, _w: &mut impl metrique_writer::EntryWriter<'a>) {}
 }
 
 impl metrique_writer::Entry for NoKey {

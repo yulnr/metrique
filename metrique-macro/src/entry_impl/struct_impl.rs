@@ -17,17 +17,23 @@ pub(crate) fn generate_struct_entry_impl(
     let (impl_generics, _, _) = impl_generics.split_for_impl();
     let (_, ty_generics, where_clause) = generics.split_for_impl();
 
+    // Use mixed_site() so generated identifiers (`writer`, `__metrique_this`) resolve
+    // correctly even when this proc macro is invoked from inside a macro_rules! macro.
+    let mixed = proc_macro2::Span::mixed_site();
+    let writer = format_ident!("writer", span = mixed);
+    let this = format_ident!("__metrique_this", span = mixed);
+
     // we generate one entry impl for each namestyle. This will then allow the parent to
     // transitively set the namestyle
     quote! {
         const _: () = {
             #[expect(deprecated)]
             impl #impl_generics ::metrique::InflectableEntry<NS> for #entry_name #ty_generics #where_clause {
-                fn write<'__metrique_write>(&'__metrique_write self, writer: &mut impl ::metrique::writer::EntryWriter<'__metrique_write>) {
+                fn write_fields<'__metrique_write>(#this: &'__metrique_write Self, #writer: &mut impl ::metrique::writer::EntryWriter<'__metrique_write>) {
                     #(#writes)*
                 }
 
-                fn sample_group(&self) -> impl ::std::iter::Iterator<Item = (::std::borrow::Cow<'static, str>, ::std::borrow::Cow<'static, str>)> {
+                fn sample_group_fields(#this: &Self) -> impl ::std::iter::Iterator<Item = (::std::borrow::Cow<'static, str>, ::std::borrow::Cow<'static, str>)> {
                     #sample_groups
                 }
             }
@@ -37,26 +43,33 @@ pub(crate) fn generate_struct_entry_impl(
 
 fn generate_write_statements(fields: &[MetricsField], root_attrs: &RootAttributes) -> Vec<Ts2> {
     let mut writes = Vec::new();
+    let mixed = proc_macro2::Span::mixed_site();
+    let writer = format_ident!("writer", span = mixed);
+    let this = format_ident!("__metrique_this", span = mixed);
 
     for field_ident in root_attrs.configuration_field_names() {
         writes.push(quote! {
-            ::metrique::writer::Entry::write(&self.#field_ident, writer);
+            ::metrique::writer::Entry::write(&#this.#field_ident, #writer);
         });
     }
 
     writes.extend(generate_field_writes(
         fields,
         root_attrs,
-        |field_ident| quote! { &self.#field_ident },
+        |field_ident| quote! { &#this.#field_ident },
     ));
     writes
 }
 
 fn generate_sample_group_statements(fields: &[MetricsField], root_attrs: &RootAttributes) -> Ts2 {
+    let mixed = proc_macro2::Span::mixed_site();
+    let this = format_ident!("__metrique_this", span = mixed);
+
     let sample_group_fields: Vec<_> = fields
         .iter()
         .filter_map(|field| {
-            collect_field_sample_group(field, root_attrs, |f| quote! { &self.#f })
+            let this = this.clone();
+            collect_field_sample_group(field, root_attrs, |f| quote! { &#this.#f })
                 .map(|(_, iter)| iter)
         })
         .collect();
