@@ -200,9 +200,7 @@ mod tests {
     use metrique_writer::sink::AttachGlobalEntrySink;
     use metrique_writer::test_util::{TestEntrySink, test_entry_sink};
 
-    use super::{
-        AttachGlobalEntrySinkTokioMetricsExt, MetricNameStyle, TokioRuntimeMetricsConfig,
-    };
+    use super::{AttachGlobalEntrySinkTokioMetricsExt, MetricNameStyle, TokioRuntimeMetricsConfig};
 
     #[tokio::test(start_paused = true)]
     async fn subscribe_appends_metrics_identity() {
